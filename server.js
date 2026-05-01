@@ -9,6 +9,32 @@ app.use(express.json());
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 
+// Cache de URLs — evita llamar yt-dlp múltiples veces
+const urlCache = new Map();
+const CACHE_TTL = 4 * 60 * 1000; // 4 minutos (URLs de YouTube expiran en ~6 min)
+
+async function getAudioUrl(videoId) {
+  const cached = urlCache.get(videoId);
+  if (cached && Date.now() - cached.ts < CACHE_TTL) {
+    console.log(`Cache hit: ${videoId}`);
+    return cached.url;
+  }
+
+  console.log(`Fetching URL for: ${videoId}`);
+  const output = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
+    format: 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+    getUrl: true,
+    noCheckCertificates: true,
+    noWarnings: true,
+    preferFreeFormats: true,
+    addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0'],
+  });
+
+  const url = (Array.isArray(output) ? output[0] : output).trim();
+  urlCache.set(videoId, { url, ts: Date.now() });
+  return url;
+}
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Servidor Quazar funcionando 🎵' });
 });
@@ -32,54 +58,37 @@ app.get('/search', async (req, res) => {
       thumbnail: item.snippet.thumbnails.high.url,
     }));
 
+    // Pre-cachear las primeras 3 canciones en segundo plano
+    songs.slice(0, 3).forEach(song => {
+      if (!urlCache.has(song.id)) {
+        getAudioUrl(song.id).catch(() => {});
+      }
+    });
+
     res.json({ songs });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Devuelve la URL del stream
 app.get('/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
-
   try {
-    const output = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
-      format: 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
-      getUrl: true,
-      noCheckCertificates: true,
-      noWarnings: true,
-      preferFreeFormats: true,
-      addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0'],
-    });
-
-    const url = Array.isArray(output) ? output[0] : output;
-    if (!url) return res.status(404).json({ error: 'No se encontró audio' });
-
-    res.json({ url: url.trim() });
+    const url = await getAudioUrl(videoId);
+    res.json({ url });
   } catch (error) {
-    res.status(500).json({ error: 'Error obteniendo stream: ' + error.message });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Proxy del audio — Android puede reproducir esto directamente
 app.get('/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
 
   try {
-    const output = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
-      format: 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
-      getUrl: true,
-      noCheckCertificates: true,
-      noWarnings: true,
-      preferFreeFormats: true,
-      addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0'],
-    });
-
-    const audioUrl = Array.isArray(output) ? output[0] : output;
-    if (!audioUrl) return res.status(404).json({ error: 'No se encontró audio' });
-
+    const audioUrl = await getAudioUrl(videoId);
     const { default: fetch } = await import('node-fetch');
-    const audioResponse = await fetch(audioUrl.trim(), {
+
+    const audioResponse = await fetch(audioUrl, {
       headers: {
         'referer': 'https://www.youtube.com',
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -89,6 +98,7 @@ app.get('/proxy/:videoId', async (req, res) => {
 
     res.setHeader('Content-Type', audioResponse.headers.get('content-type') || 'audio/webm');
     res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Access-Control-Allow-Origin', '*');
 
     const contentRange = audioResponse.headers.get('content-range');
     const contentLength = audioResponse.headers.get('content-length');
@@ -105,4 +115,3 @@ app.get('/proxy/:videoId', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor Quazar corriendo en puerto ${PORT} 🎵`));
-
