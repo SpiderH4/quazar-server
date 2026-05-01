@@ -1,2 +1,5 @@
 [phases.setup]
-nixPkgs = ["python3"]
+nixPkgs = ["python3", "nodejs"]
+
+[phases.build]
+cmds = ["npm install"]
