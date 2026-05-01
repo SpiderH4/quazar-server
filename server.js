@@ -9,7 +9,7 @@ app.use(express.json());
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 
-// Cache — evita llamar yt-dlp más de una vez por canción
+// Cache de URLs
 const urlCache = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
 
@@ -40,6 +40,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Servidor Quazar funcionando 🎵' });
 });
 
+// Buscar canciones
 app.get('/search', async (req, res) => {
   const { q } = req.query;
   if (!q) return res.status(400).json({ error: 'Falta el parámetro q' });
@@ -59,7 +60,7 @@ app.get('/search', async (req, res) => {
       thumbnail: item.snippet.thumbnails.high.url,
     }));
 
-    // Pre-cachear primeras 5 canciones en paralelo mientras el usuario ve resultados
+    // Pre-cachear primeras 5 canciones en paralelo
     Promise.all(songs.slice(0, 5).map(s => getAudioUrl(s.id).catch(() => {})));
 
     res.json({ songs });
@@ -68,6 +69,18 @@ app.get('/search', async (req, res) => {
   }
 });
 
+// Devuelve URL directa del audio
+app.get('/stream/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+  try {
+    const url = await getAudioUrl(videoId);
+    res.json({ url });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Proxy del audio con soporte de range requests
 app.get('/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
 
