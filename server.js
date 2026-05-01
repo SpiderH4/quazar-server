@@ -1,86 +1,104 @@
-async function getAudioUrlInnertube(videoId) {
+const express = require('express');
+const cors = require('cors');
+const youtubedl = require('youtube-dl-exec');
+require('dotenv').config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
+
+// Cache — evita llamar yt-dlp más de una vez por canción
+const urlCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000;
+
+async function getAudioUrl(videoId) {
   const cached = urlCache.get(videoId);
   if (cached && Date.now() - cached.ts < CACHE_TTL) {
+    console.log(`✅ Cache hit: ${videoId}`);
     return cached.url;
   }
 
-  const { default: fetch } = await import('node-fetch');
-
-  // Intentar múltiples clientes
-  const clients = [
-    {
-      clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
-      clientVersion: '2.0',
-      key: 'AIzaSyDCU8hByM-4DrUqRUYnGn-3llEO78bcxq8',
-    },
-    {
-      clientName: 'IOS',
-      clientVersion: '19.09.3',
-      key: 'AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc',
-    },
-    {
-      clientName: 'ANDROID_EMBEDDED_PLAYER',
-      clientVersion: '19.09.37',
-      key: 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
-    },
-  ];
-
-  for (const client of clients) {
-    try {
-      const payload = {
-        videoId,
-        context: {
-          client: {
-            clientName: client.clientName,
-            clientVersion: client.clientVersion,
-            hl: 'en',
-            gl: 'US',
-          }
-        }
-      };
-
-      const response = await fetch(
-        `https://www.youtube.com/youtubei/v1/player?key=${client.key}`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0',
-          },
-          body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(8000),
-        }
-      );
-
-      const data = await response.json();
-      const formats = [
-        ...(data.streamingData?.adaptiveFormats || []),
-        ...(data.streamingData?.formats || []),
-      ].filter(f => f.mimeType?.includes('audio') && f.url);
-
-      if (formats.length > 0) {
-        const m4a = formats.find(f => f.mimeType?.includes('mp4'));
-        const best = m4a || formats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-        if (best?.url) {
-          urlCache.set(videoId, { url: best.url, ts: Date.now() });
-          return best.url;
-        }
-      }
-    } catch (_) {
-      continue;
-    }
-  }
-
-  // Fallback a yt-dlp si todos los clientes fallan
-  const youtubedl = require('youtube-dl-exec');
+  console.log(`🔄 Fetching: ${videoId}`);
   const output = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
-    format: 'bestaudio[ext=m4a]/bestaudio',
+    format: 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
     getUrl: true,
     noCheckCertificates: true,
     noWarnings: true,
+    preferFreeFormats: true,
+    addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0'],
   });
 
   const url = (Array.isArray(output) ? output[0] : output).trim();
   urlCache.set(videoId, { url, ts: Date.now() });
+  console.log(`✅ Cached: ${videoId}`);
   return url;
 }
+
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', message: 'Servidor Quazar funcionando 🎵' });
+});
+
+app.get('/search', async (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.status(400).json({ error: 'Falta el parámetro q' });
+
+  try {
+    const { default: fetch } = await import('node-fetch');
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&q=${encodeURIComponent(q)}&maxResults=20&key=${YOUTUBE_API_KEY}`;
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (data.error) return res.status(500).json({ error: data.error.message });
+
+    const songs = data.items.map(item => ({
+      id: item.id.videoId,
+      title: item.snippet.title,
+      artist: item.snippet.channelTitle,
+      thumbnail: item.snippet.thumbnails.high.url,
+    }));
+
+    // Pre-cachear primeras 5 canciones en paralelo mientras el usuario ve resultados
+    Promise.all(songs.slice(0, 5).map(s => getAudioUrl(s.id).catch(() => {})));
+
+    res.json({ songs });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/proxy/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+
+  try {
+    const audioUrl = await getAudioUrl(videoId);
+    const { default: fetch } = await import('node-fetch');
+
+    const audioResponse = await fetch(audioUrl, {
+      headers: {
+        'referer': 'https://www.youtube.com',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'range': req.headers.range || 'bytes=0-',
+      },
+    });
+
+    res.setHeader('Content-Type', audioResponse.headers.get('content-type') || 'audio/mp4');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    const contentRange = audioResponse.headers.get('content-range');
+    const contentLength = audioResponse.headers.get('content-length');
+    if (contentRange) res.setHeader('Content-Range', contentRange);
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+
+    res.status(audioResponse.status);
+    audioResponse.body.pipe(res);
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Servidor Quazar corriendo en puerto ${PORT} 🎵`));
