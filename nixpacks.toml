@@ -1,2 +1,8 @@
 [phases.setup]
-nixPkgs = ["yt-dlp", "python3"]
+nixPkgs = ["python3", "pip"]
+
+[phases.install]
+cmds = ["npm ci", "pip install yt-dlp"]
+
+[start]
+cmd = "node server.js"
