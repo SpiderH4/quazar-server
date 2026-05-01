@@ -1,8 +1,0 @@
-[phases.setup]
-nixPkgs = ["python312", "python312Packages.pip"]
-
-[phases.install]
-cmds = ["npm ci", "python3 -m pip install yt-dlp --break-system-packages"]
-
-[start]
-cmd = "node server.js"

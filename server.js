@@ -1,10 +1,8 @@
 const express = require('express');
 const cors = require('cors');
-const { exec } = require('child_process');
-const { promisify } = require('util');
+const youtubedl = require('youtube-dl-exec');
 require('dotenv').config();
 
-const execAsync = promisify(exec);
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -15,7 +13,6 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Servidor Quazar funcionando 🎵' });
 });
 
-// Buscar canciones
 app.get('/search', async (req, res) => {
   const { q } = req.query;
   if (!q) return res.status(400).json({ error: 'Falta el parámetro q' });
@@ -41,22 +38,24 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// Stream con yt-dlp
 app.get('/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
 
   try {
-    const { stdout } = await execAsync(
-      `yt-dlp -f bestaudio --get-url "https://www.youtube.com/watch?v=${videoId}"`,
-      { timeout: 30000 }
-    );
+    const output = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
+      format: 'bestaudio',
+      getUrl: true,
+      noCheckCertificates: true,
+      noWarnings: true,
+      preferFreeFormats: true,
+    });
 
-    const url = stdout.trim();
+    const url = Array.isArray(output) ? output[0] : output;
     if (!url) return res.status(404).json({ error: 'No se encontró audio' });
 
-    res.json({ url });
+    res.json({ url: url.trim() });
   } catch (error) {
-    res.status(500).json({ error: 'yt-dlp falló: ' + error.message });
+    res.status(500).json({ error: 'Error obteniendo stream: ' + error.message });
   }
 });
 
