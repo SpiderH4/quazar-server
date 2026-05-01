@@ -9,30 +9,6 @@ app.use(express.json());
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 
-// Cache de URLs para no llamar yt-dlp cada vez
-const urlCache = new Map();
-const CACHE_DURATION = 3 * 60 * 1000; // 3 minutos
-
-async function getAudioUrl(videoId) {
-  const cached = urlCache.get(videoId);
-  if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
-    return cached.url;
-  }
-
-  const output = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
-    format: 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-    getUrl: true,
-    noCheckCertificates: true,
-    noWarnings: true,
-    preferFreeFormats: true,
-    addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'],
-  });
-
-  const url = (Array.isArray(output) ? output[0] : output).trim();
-  urlCache.set(videoId, { url, timestamp: Date.now() });
-  return url;
-}
-
 app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Servidor Quazar funcionando 🎵' });
 });
@@ -62,58 +38,71 @@ app.get('/search', async (req, res) => {
   }
 });
 
+// Devuelve la URL del stream
 app.get('/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
+
   try {
-    const url = await getAudioUrl(videoId);
-    res.json({ url });
+    const output = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
+      format: 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
+      getUrl: true,
+      noCheckCertificates: true,
+      noWarnings: true,
+      preferFreeFormats: true,
+      addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0'],
+    });
+
+    const url = Array.isArray(output) ? output[0] : output;
+    if (!url) return res.status(404).json({ error: 'No se encontró audio' });
+
+    res.json({ url: url.trim() });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Error obteniendo stream: ' + error.message });
   }
 });
 
-// Proxy con soporte completo de range requests
+// Proxy del audio — Android puede reproducir esto directamente
 app.get('/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
 
   try {
-    const audioUrl = await getAudioUrl(videoId);
+    const output = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
+      format: 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
+      getUrl: true,
+      noCheckCertificates: true,
+      noWarnings: true,
+      preferFreeFormats: true,
+      addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0'],
+    });
+
+    const audioUrl = Array.isArray(output) ? output[0] : output;
+    if (!audioUrl) return res.status(404).json({ error: 'No se encontró audio' });
+
     const { default: fetch } = await import('node-fetch');
+    const audioResponse = await fetch(audioUrl.trim(), {
+      headers: {
+        'referer': 'https://www.youtube.com',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'range': req.headers.range || 'bytes=0-',
+      },
+    });
 
-    const rangeHeader = req.headers.range;
-    const headers = {
-      'referer': 'https://www.youtube.com',
-      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'origin': 'https://www.youtube.com',
-    };
+    res.setHeader('Content-Type', audioResponse.headers.get('content-type') || 'audio/webm');
+    res.setHeader('Accept-Ranges', 'bytes');
 
-    if (rangeHeader) {
-      headers['range'] = rangeHeader;
-    }
-
-    const audioResponse = await fetch(audioUrl, { headers });
-
-    // Copiar headers relevantes
-    const contentType = audioResponse.headers.get('content-type') || 'audio/webm';
-    const contentLength = audioResponse.headers.get('content-length');
     const contentRange = audioResponse.headers.get('content-range');
-    const acceptRanges = audioResponse.headers.get('accept-ranges') || 'bytes';
-
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Accept-Ranges', acceptRanges);
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    if (contentLength) res.setHeader('Content-Length', contentLength);
+    const contentLength = audioResponse.headers.get('content-length');
     if (contentRange) res.setHeader('Content-Range', contentRange);
+    if (contentLength) res.setHeader('Content-Length', contentLength);
 
     res.status(audioResponse.status);
     audioResponse.body.pipe(res);
 
   } catch (error) {
-    console.error('Proxy error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor Quazar corriendo en puerto ${PORT} 🎵`));
+
