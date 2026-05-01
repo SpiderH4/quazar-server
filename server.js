@@ -38,16 +38,18 @@ app.get('/search', async (req, res) => {
   }
 });
 
+// Devuelve la URL del stream
 app.get('/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
 
   try {
     const output = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
-      format: 'bestaudio',
+      format: 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
       getUrl: true,
       noCheckCertificates: true,
       noWarnings: true,
       preferFreeFormats: true,
+      addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0'],
     });
 
     const url = Array.isArray(output) ? output[0] : output;
@@ -56,6 +58,48 @@ app.get('/stream/:videoId', async (req, res) => {
     res.json({ url: url.trim() });
   } catch (error) {
     res.status(500).json({ error: 'Error obteniendo stream: ' + error.message });
+  }
+});
+
+// Proxy del audio — Android puede reproducir esto directamente
+app.get('/proxy/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+
+  try {
+    const output = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
+      format: 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
+      getUrl: true,
+      noCheckCertificates: true,
+      noWarnings: true,
+      preferFreeFormats: true,
+      addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0'],
+    });
+
+    const audioUrl = Array.isArray(output) ? output[0] : output;
+    if (!audioUrl) return res.status(404).json({ error: 'No se encontró audio' });
+
+    const { default: fetch } = await import('node-fetch');
+    const audioResponse = await fetch(audioUrl.trim(), {
+      headers: {
+        'referer': 'https://www.youtube.com',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'range': req.headers.range || 'bytes=0-',
+      },
+    });
+
+    res.setHeader('Content-Type', audioResponse.headers.get('content-type') || 'audio/webm');
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    const contentRange = audioResponse.headers.get('content-range');
+    const contentLength = audioResponse.headers.get('content-length');
+    if (contentRange) res.setHeader('Content-Range', contentRange);
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+
+    res.status(audioResponse.status);
+    audioResponse.body.pipe(res);
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
