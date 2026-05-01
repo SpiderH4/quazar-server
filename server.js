@@ -1,6 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const youtubedl = require('youtube-dl-exec');
 require('dotenv').config();
 
 const app = express();
@@ -9,30 +8,62 @@ app.use(express.json());
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 
-// Cache de URLs — evita llamar yt-dlp múltiples veces
+// Cache de URLs
 const urlCache = new Map();
-const CACHE_TTL = 4 * 60 * 1000; // 4 minutos (URLs de YouTube expiran en ~6 min)
+const CACHE_TTL = 5 * 60 * 1000;
 
-async function getAudioUrl(videoId) {
+// Llama directamente a la API interna de YouTube (Innertube)
+async function getAudioUrlInnertube(videoId) {
   const cached = urlCache.get(videoId);
   if (cached && Date.now() - cached.ts < CACHE_TTL) {
-    console.log(`Cache hit: ${videoId}`);
     return cached.url;
   }
 
-  console.log(`Fetching URL for: ${videoId}`);
-  const output = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
-    format: 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-    getUrl: true,
-    noCheckCertificates: true,
-    noWarnings: true,
-    preferFreeFormats: true,
-    addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0'],
-  });
+  const { default: fetch } = await import('node-fetch');
 
-  const url = (Array.isArray(output) ? output[0] : output).trim();
-  urlCache.set(videoId, { url, ts: Date.now() });
-  return url;
+  const payload = {
+    videoId,
+    context: {
+      client: {
+        clientName: 'ANDROID',
+        clientVersion: '19.09.37',
+        androidSdkVersion: 30,
+        hl: 'en',
+        gl: 'US',
+      }
+    }
+  };
+
+  const response = await fetch(
+    'https://www.youtube.com/youtubei/v1/player?key=AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip',
+        'X-YouTube-Client-Name': '3',
+        'X-YouTube-Client-Version': '19.09.37',
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+
+  const data = await response.json();
+
+  // Buscar el mejor formato de audio
+  const formats = [
+    ...(data.streamingData?.adaptiveFormats || []),
+    ...(data.streamingData?.formats || []),
+  ].filter(f => f.mimeType?.includes('audio'));
+
+  // Preferir m4a (aac) porque Android lo reproduce sin problemas
+  const m4a = formats.find(f => f.mimeType?.includes('mp4') || f.mimeType?.includes('m4a'));
+  const best = m4a || formats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
+  if (!best?.url) throw new Error('No se encontró URL de audio');
+
+  urlCache.set(videoId, { url: best.url, ts: Date.now() });
+  return best.url;
 }
 
 app.get('/', (req, res) => {
@@ -58,12 +89,8 @@ app.get('/search', async (req, res) => {
       thumbnail: item.snippet.thumbnails.high.url,
     }));
 
-    // Pre-cachear las primeras 3 canciones en segundo plano
-    songs.slice(0, 3).forEach(song => {
-      if (!urlCache.has(song.id)) {
-        getAudioUrl(song.id).catch(() => {});
-      }
-    });
+    // Pre-cachear primeras 5 canciones en paralelo
+    Promise.all(songs.slice(0, 5).map(s => getAudioUrlInnertube(s.id).catch(() => {})));
 
     res.json({ songs });
   } catch (error) {
@@ -74,7 +101,7 @@ app.get('/search', async (req, res) => {
 app.get('/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
   try {
-    const url = await getAudioUrl(videoId);
+    const url = await getAudioUrlInnertube(videoId);
     res.json({ url });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -85,7 +112,7 @@ app.get('/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
 
   try {
-    const audioUrl = await getAudioUrl(videoId);
+    const audioUrl = await getAudioUrlInnertube(videoId);
     const { default: fetch } = await import('node-fetch');
 
     const audioResponse = await fetch(audioUrl, {
@@ -96,7 +123,7 @@ app.get('/proxy/:videoId', async (req, res) => {
       },
     });
 
-    res.setHeader('Content-Type', audioResponse.headers.get('content-type') || 'audio/webm');
+    res.setHeader('Content-Type', audioResponse.headers.get('content-type') || 'audio/mp4');
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Access-Control-Allow-Origin', '*');
 
