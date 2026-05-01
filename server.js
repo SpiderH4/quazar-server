@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const youtubedl = require('youtube-dl-exec');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 
 const app = express();
@@ -8,18 +10,17 @@ app.use(cors());
 app.use(express.json());
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
-
-const urlCache = new Map();
+const CACHE_DIR = '/tmp/quazar_audio';
+const URL_CACHE = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
 
-async function getAudioUrl(videoId) {
-  const cached = urlCache.get(videoId);
-  if (cached && Date.now() - cached.ts < CACHE_TTL) {
-    console.log(`✅ Cache hit: ${videoId}`);
-    return cached.url;
-  }
+// Crear directorio de cache
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-  console.log(`🔄 Fetching: ${videoId}`);
+async function getAudioUrl(videoId) {
+  const cached = URL_CACHE.get(videoId);
+  if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.url;
+
   const output = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
     format: 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
     getUrl: true,
@@ -30,8 +31,7 @@ async function getAudioUrl(videoId) {
   });
 
   const url = (Array.isArray(output) ? output[0] : output).trim();
-  urlCache.set(videoId, { url, ts: Date.now() });
-  console.log(`✅ Cached: ${videoId}`);
+  URL_CACHE.set(videoId, { url, ts: Date.now() });
   return url;
 }
 
@@ -58,7 +58,7 @@ app.get('/search', async (req, res) => {
       thumbnail: item.snippet.thumbnails.high.url,
     }));
 
-    Promise.all(songs.slice(0, 5).map(s => getAudioUrl(s.id).catch(() => {})));
+    Promise.all(songs.slice(0, 3).map(s => getAudioUrl(s.id).catch(() => {})));
 
     res.json({ songs });
   } catch (error) {
@@ -66,45 +66,70 @@ app.get('/search', async (req, res) => {
   }
 });
 
-app.get('/stream/:videoId', async (req, res) => {
+// Sirve el audio con soporte completo de range requests
+app.get('/audio/:videoId', async (req, res) => {
   const { videoId } = req.params;
-  try {
-    const url = await getAudioUrl(videoId);
-    res.redirect(302, url);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+  const filePath = path.join(CACHE_DIR, `${videoId}.m4a`);
 
-app.get('/proxy/:videoId', async (req, res) => {
-  const { videoId } = req.params;
   try {
-    const audioUrl = await getAudioUrl(videoId);
-    const { default: fetch } = await import('node-fetch');
+    // Si ya está descargado, servirlo directamente
+    if (fs.existsSync(filePath)) {
+      console.log(`✅ Archivo en cache: ${videoId}`);
+      return serveFile(filePath, req, res);
+    }
 
-    const audioResponse = await fetch(audioUrl, {
-      headers: {
-        'referer': 'https://www.youtube.com',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'range': req.headers.range || 'bytes=0-',
-      },
+    console.log(`⬇️ Descargando: ${videoId}`);
+
+    // Descargar con yt-dlp
+    await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
+      format: 'bestaudio[ext=m4a]/bestaudio',
+      output: filePath,
+      noCheckCertificates: true,
+      noWarnings: true,
     });
 
-    res.setHeader('Content-Type', audioResponse.headers.get('content-type') || 'audio/mp4');
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    if (fs.existsSync(filePath)) {
+      return serveFile(filePath, req, res);
+    }
 
-    const contentRange = audioResponse.headers.get('content-range');
-    const contentLength = audioResponse.headers.get('content-length');
-    if (contentRange) res.setHeader('Content-Range', contentRange);
-    if (contentLength) res.setHeader('Content-Length', contentLength);
-
-    res.status(audioResponse.status);
-    audioResponse.body.pipe(res);
+    res.status(500).json({ error: 'No se pudo descargar el audio' });
   } catch (error) {
+    console.error('Error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
+
+function serveFile(filePath, req, res) {
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  if (range) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunkSize = end - start + 1;
+
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunkSize,
+      'Content-Type': 'audio/mp4',
+      'Access-Control-Allow-Origin': '*',
+    });
+
+    fs.createReadStream(filePath, { start, end }).pipe(res);
+  } else {
+    res.writeHead(200, {
+      'Content-Length': fileSize,
+      'Content-Type': 'audio/mp4',
+      'Accept-Ranges': 'bytes',
+      'Access-Control-Allow-Origin': '*',
+    });
+
+    fs.createReadStream(filePath).pipe(res);
+  }
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor Quazar corriendo en puerto ${PORT} 🎵`));
